@@ -288,3 +288,220 @@ python3 bench_client.py --concurrency 8 --num_requests 16 \
   最小TTFT:       1.182s
   QPS:            1.62
 ```
+
+---
+
+## 非 root 用户部署改造指南（去 root 化）
+
+### 问题背景
+
+当前镜像内所有文件（Python site-packages、conda 环境、Ascend toolkit 等）均以 root 用户安装，运行时也默认以 root 身份启动。当客户安全规范要求**禁止以 root 用户运行任何脚本和服务**时，切换到普通用户（如 HwHiAiUser）后会遇到一系列权限问题，典型报错如下：
+
+```
+ERROR: Fst::WriteFile: Can't open file: /usr/local/lib/python3.11/site-packages/tn/zh_tn_tagger.fst
+_pywrapfst.FstIOError: Write failed: '/usr/local/lib/python3.11/site-packages/tn/zh_tn_tagger.fst'
+```
+
+**根因**：WeTextProcessing（tn 库）在初始化中文/英文 Normalizer 时，默认将 FST 缓存文件写入 Python site-packages 目录（root 所有），非 root 用户无法写入。
+
+### 权限问题全景清单
+
+切换到非 root 用户（如 HwHiAiUser）后，预计会遇到以下 5 类权限问题：
+
+| # | 问题描述 | 报错路径/命令 | 严重程度 | 触发时机 |
+|---|---------|-------------|---------|---------|
+| 1 | WeTextProcessing 中文 Normalizer 写 FST 缓存到 site-packages | `/usr/local/lib/python3.11/site-packages/tn/zh_tn_tagger.fst` 等 | **致命** | 每次启动（`overwrite_cache=True`） |
+| 2 | WeTextProcessing 英文 Normalizer 写 FST 缓存到 site-packages | 同上目录，`en_tn_tagger.fst` 等 | **致命** | 首次启动（`overwrite_cache=False`） |
+| 3 | run_server.sh 中 `sed -i` 修改 modelscope 的 ast_utils.py | `/usr/local/lib/python3.11/site-packages/modelscope/utils/ast_utils.py` | **严重** | 每次启动 |
+| 4 | run_server.sh 中 `pip install` 安装 FastAPI 等依赖 | `pip install fastapi uvicorn python-multipart requests` | **严重** | 每次启动 |
+| 5 | 镜像内所有目录/文件为 root 所有，非 root 用户无写权限 | `/opt/conda/`、`/usr/local/lib/` 等全局 | **基础** | 全局影响 |
+
+### 问题分类：模型代码 vs 服务脚本
+
+| 问题 | 来源 | 说明 |
+|------|------|------|
+| #1 ZhNormalizer `overwrite_cache=True` 写 site-packages | **模型代码**（`cosyvoice/cli/frontend.py:71`） | CosyVoice 上游代码的设计缺陷：默认 cache_dir 指向 site-packages |
+| #2 EnNormalizer 首次写 site-packages | **模型代码**（`cosyvoice/cli/frontend.py:72`） | 同上，首次运行也需写 FST 文件 |
+| #3 `sed -i` 修改 modelscope | **服务脚本**（`deploy.sh` 内嵌的 `run_server.sh` Step 2） | 我们在启动脚本中引入的运行时补丁 |
+| #4 `pip install` FastAPI | **服务脚本**（`run_server.sh` Step 3） | 我们在启动脚本中引入的运行时安装 |
+| #5 镜像文件全部 root 所有 | **镜像构建**（Dockerfile 无 USER 指令） | 镜像层面的问题 |
+
+**结论**：当前报错的核心原因是**模型代码本身**的问题（#1），不是服务脚本造成的。但服务脚本（#3、#4）和镜像构建（#5）引入了额外的权限问题，需要一并解决。
+
+---
+
+### 改造方案：三层改造
+
+以下方案从镜像构建、模型代码、服务脚本三个层面彻底消除 root 权限依赖。建议三层全部完成，确保在任何非 root 环境下都能正常运行。
+
+#### 第一层：Dockerfile 改造（最关键）
+
+在 Dockerfile 中完成所有需要 root 权限的操作（安装、补丁、预构建），然后切换到非 root 用户。这样运行时不再需要任何 root 权限。
+
+在现有 Dockerfile 的所有安装命令**之后**，添加以下内容：
+
+```dockerfile
+# ====== 去 root 化改造 ======
+
+# Step A: 预构建 WeTextProcessing FST 缓存（构建时以 root 完成，运行时无需再写）
+# 这一步会生成 zh_tn_tagger.fst / zh_tn_verbalizer.fst / en_tn_tagger.fst / en_tn_verbalizer.fst
+RUN conda activate cosyvoice && \
+    python3 -c "from tn.chinese.normalizer import Normalizer as ZhNormalizer; ZhNormalizer(overwrite_cache=True)" && \
+    python3 -c "from tn.english.normalizer import Normalizer as EnNormalizer; EnNormalizer()"
+
+# Step B: 预打 modelscope ast_utils.py 补丁（不再需要在运行时 sed -i）
+# 注意：路径需要根据实际 Python 版本和安装位置调整
+# 查找方法：python3 -c "import modelscope; print(modelscope.__file__)"
+RUN AST_UTILS=$(python3 -c "import os, modelscope; print(os.path.join(os.path.dirname(modelscope.__file__), 'utils', 'ast_utils.py'))") && \
+    if [ -f "$AST_UTILS" ] && ! grep -q 'getattr(node, field, None)' "$AST_UTILS"; then \
+        sed -i 's/attr = getattr(node, field)$/attr = getattr(node, field, None)/' "$AST_UTILS"; \
+        echo "Patched modelscope ast_utils.py: $AST_UTILS"; \
+    fi
+
+# Step C: 将关键目录的 ownership 赋予 HwHiAiUser，确保运行时可写
+# 注意：根据实际镜像中的用户名和目录调整，以下为昇腾镜像典型路径
+ARG RUNTIME_USER=HwHiAiUser
+RUN chown -R ${RUNTIME_USER}:${RUNTIME_USER} /opt/conda \
+ && chown -R ${RUNTIME_USER}:${RUNTIME_USER} /home/${RUNTIME_USER} \
+ && if [ -d /usr/local/lib/python3.11/site-packages ]; then \
+        chown -R ${RUNTIME_USER}:${RUNTIME_USER} /usr/local/lib/python3.11/site-packages; \
+    fi
+
+# Step D: 切换到非 root 用户
+USER ${RUNTIME_USER}
+WORKDIR /home/${RUNTIME_USER}/CosyVoice
+```
+
+**注意事项**：
+- `Step C` 中的 chown 路径需要根据实际镜像结构调整。如果 Python 包安装在 `/opt/conda/envs/cosyvoice/lib/python3.10/site-packages/` 而非 `/usr/local/lib/python3.11/site-packages/`，则 chown 那条路径即可（因为 `/opt/conda` 已被整体 chown）。
+- 如果镜像中尚未创建 HwHiAiUser 用户，需在 Dockerfile 中先添加 `RUN useradd -m -u 1000 HwHiAiUser`。
+- 如果客户使用其他用户名（如 hw），将 `ARG RUNTIME_USER` 的默认值改为对应用户名即可。
+
+#### 第二层：模型代码改造（消除运行时对 site-packages 的写入）
+
+修改 `cosyvoice/cli/frontend.py`，将 WeTextProcessing 的 FST 缓存目录从 site-packages 改为用户 home 下的可写目录。
+
+**修改文件**：`cosyvoice/cli/frontend.py`
+
+**修改前**（第 71-72 行）：
+
+```python
+        else:
+            self.zh_tn_model = ZhNormalizer(remove_erhua=False, full_to_half=False, overwrite_cache=True)
+            self.en_tn_model = EnNormalizer()
+            self.inflect_parser = inflect.engine()
+```
+
+**修改后**：
+
+```python
+        else:
+            tn_cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'cosyvoice', 'tn')
+            os.makedirs(tn_cache_dir, exist_ok=True)
+            self.zh_tn_model = ZhNormalizer(remove_erhua=False, full_to_half=False, overwrite_cache=True, cache_dir=tn_cache_dir)
+            self.en_tn_model = EnNormalizer(cache_dir=tn_cache_dir)
+            self.inflect_parser = inflect.engine()
+```
+
+**原理说明**：
+- `ZhNormalizer` 和 `EnNormalizer` 默认 `cache_dir=files("tn")`，指向 site-packages 内的 tn 包目录（root 所有，不可写）
+- 改为 `~/.cache/cosyvoice/tn/` 后，FST 缓存文件写到用户 home 目录下，任何用户都有写权限
+- `overwrite_cache=True` 保持不变（中文 Normalizer 每次启动仍会重写缓存，但写入位置改为用户目录）
+- 这个改动兼容 root 和非 root 用户：root 的 home 是 `/root`，HwHiAiUser 的 home 是 `/home/HwHiAiUser`，各自可写
+
+#### 第三层：服务脚本改造（消除运行时 pip install 和 sed -i）
+
+修改 `deploy.sh` 中内嵌的 `run_server.sh` 部分，删除运行时修改系统文件的操作。
+
+**修改文件**：`deploy.sh`
+
+**删除 Step 2（modelscope 补丁）**——整个 for 循环块（约第 674-679 行）：
+
+```bash
+# ===== Step 2: Patch modelscope for Python 3.11 compatibility (fallback) =====
+# ... 删除整个 Step 2 ...
+```
+
+> 此补丁已在 Dockerfile Step B 中预完成，运行时无需再执行。
+
+**删除 Step 3（pip install）**——整行（约第 683 行）：
+
+```bash
+pip install fastapi uvicorn python-multipart requests 2>/dev/null | tail -1
+```
+
+> FastAPI 等依赖应在镜像构建时安装（在 Dockerfile 中添加 `RUN pip install fastapi uvicorn python-multipart requests`），运行时无需再安装。
+
+如果确实需要在运行时安装 pip 包（如临时补丁），应改用 `pip install --user`：
+
+```bash
+pip install --user fastapi uvicorn python-multipart requests 2>/dev/null | tail -1
+```
+
+---
+
+### 改造验证步骤
+
+完成三层改造后，按以下步骤验证非 root 用户能否正常启动服务：
+
+```bash
+# 1. 确认当前用户不是 root
+id
+# 期望输出：uid=1000(HwHiAiUser) ... 而非 uid=0(root)
+
+# 2. 确认 FST 缓存目录可写
+ls -la ~/.cache/cosyvoice/tn/
+# 期望：目录存在且归属当前用户
+
+# 3. 确认 modelscope 补丁已生效（Dockerfile 预打补丁）
+python3 -c "import modelscope.utils.ast_utils; print('OK')"
+# 期望：无报错
+
+# 4. 确认 tn 缓存写到用户目录而非 site-packages
+python3 -c "
+from tn.chinese.normalizer import Normalizer as ZhNormalizer
+import os
+cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'cosyvoice', 'tn')
+n = ZhNormalizer(overwrite_cache=True, cache_dir=cache_dir)
+print('FST cache written to:', cache_dir)
+ls = os.listdir(cache_dir)
+print('Files:', ls)
+"
+# 期望：输出 zh_tn_tagger.fst / zh_tn_verbalizer.fst，且路径在 ~/.cache/ 下
+
+# 5. 启动服务并观察日志
+bash run_server.sh ../weight/CosyVoice2-0.5B 2 50000
+# 期望：无 Write failed / Permission denied 报错，Worker 正常加载模型
+
+# 6. 健康检查
+python3 client.py --mode health
+# 期望：返回 {"status":"ok","workers":2,...}
+```
+
+---
+
+### 最小化改造路径（紧急修复）
+
+如果时间紧迫，**只做第一层（Dockerfile 改造）** 就能解决当前报错，因为：
+
+- Step A 预构建了 FST 缓存 → 运行时 tn 包目录中已有缓存文件
+- Step C chown 了 site-packages → 即使 `overwrite_cache=True` 仍尝试写入 site-packages，但 HwHiAiUser 现在有写权限
+- Step B 预打了 modelscope 补丁 → 运行时不再需要 `sed -i`
+
+**但此方案有隐患**：`overwrite_cache=True` 仍然会在每次启动时重写 site-packages 中的 FST 文件，依赖 chown 赋予的写权限。一旦客户环境对 site-packages 有只读保护（如安全策略强制挂载为只读），仍会失败。
+
+**推荐做法**：紧急修复用第一层快速上线，后续补上第二层（改 cache_dir）彻底根治。三层全部完成后，服务不再依赖任何 site-packages 写权限，完全符合"去 root"要求。
+
+---
+
+### 补充说明
+
+**torchair 缓存**：`torch.compile` 会在当前工作目录下创建 `.torchair_cache/` 目录。如果 CWD 是 root 所有的目录，非 root 用户无法写入。确保 WORKDIR 设置在用户 home 下（如 `/home/HwHiAiUser/CosyVoice`），或在 `run_server.sh` 中添加：
+
+```bash
+export TORCHAIR_CACHE_DIR=~/.cache/torchair
+```
+
+**modelscope 模型下载缓存**：`snapshot_download()` 默认写入 `~/.cache/modelscope/`，属于用户 home 目录，非 root 用户可写，无需改造。
+
+**临时文件**：服务上传音频时使用 `tempfile.gettempdir()`（通常为 `/tmp`），Linux 默认 `/tmp` 有 sticky bit 且所有用户可写，无需改造。但如果客户环境将 `/tmp` 设为只读，需设置 `export TMPDIR=~/.tmp` 并预先创建该目录。
