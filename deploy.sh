@@ -3,20 +3,8 @@
 # Run from within CosyVoice directory:
 #   cd CosyVoice && bash deploy.sh
 #
-# This creates 3 files at project root (server.py, client.py, run_server.sh).
+# Creates 4 files: server.py, client.py, run_server.sh, bench_client.py
 # Uses heredoc with single-quoted delimiters to prevent shell expansion.
-#
-# Changes from previous version:
-#   - server.py: removed torch_npu.npu.set_device(0), matching infer.py (device auto-selected by ASCEND_RT_VISIBLE_DEVICES)
-#   - server.py: each worker waits on start_warmup_queue before doing warmup inference
-#   - server.py: warmup timeout 900s (15min) per worker (sequential, no NPU competition)
-#   - server.py: _discover_lib_dirs() dynamically finds Python/conda/Ascend/system lib dirs
-#   - server.py: _setup_npu_env() preloads libhccl.so + libfstmpdtscript.so.26 + libfst.so.26
-#   - server.py: added `import numpy as np` (was missing, used in audio processing)
-#   - server.py: _padded_hift_inference computes f0/source/s_stft from UNPADDED input (accurate), then zero-pads speech_feat+s_stft for decode
-#   - run_server.sh: conda search now checks 7 locations + `which conda` fallback
-#   - run_server.sh: new Step 5 adds Python/conda/OpenFst lib dirs to LD_LIBRARY_PATH
-#   - run_server.sh: ASCEND_RT_VISIBLE_DEVICES no longer overrides user-set value
 
 echo "=== CosyVoice2 Multi-Process Streaming TTS Server Deployment ==="
 
@@ -136,8 +124,12 @@ def _setup_npu_env():
                     continue
 
 
-def worker_process(worker_id: int, model_path: str, task_queue, ready_queue, warmup_times: int, start_warmup_queue):
+def worker_process(worker_id: int, model_path: str, task_queue, ready_queue, warmup_signal, load_semaphore):
     try:
+        logger.info(f"[W-{worker_id}] Waiting for load slot...")
+        load_semaphore.get()
+        logger.info(f"[W-{worker_id}] Acquired load slot, starting initialization...")
+
         _setup_npu_env()
 
         import torch
@@ -158,12 +150,15 @@ def worker_process(worker_id: int, model_path: str, task_queue, ready_queue, war
         spk_list = cosyvoice.list_available_spks()
 
         logger.info(f"[W-{worker_id}] Model loaded, waiting for warmup signal...")
-        start_warmup_queue.get()
+        warmup_signal.get()
 
         with torch.no_grad():
             logger.info(f"[W-{worker_id}] Warming up with 1 real inference...")
             next(cosyvoice.inference_sft('你好世界。', '中文女', stream=True))
             logger.info(f"[W-{worker_id}] Warmup done")
+
+        load_semaphore.put('token')
+        logger.info(f"[W-{worker_id}] Released load slot (after warmup).")
 
         ready_queue.put(('ready', worker_id, spk_list, sample_rate))
         logger.info(f"[W-{worker_id}] Service ready")
@@ -406,35 +401,39 @@ if __name__ == '__main__':
     parser.add_argument('--model_dir', type=str, required=True, help='Model directory path')
     parser.add_argument('--num_workers', type=int, default=2, help='Number of worker processes (each loads one model instance)')
     parser.add_argument('--port', type=int, default=50000, help='Server port')
-    parser.add_argument('--warmup_times', type=int, default=2, help='Warmup iterations per worker')
+    parser.add_argument('--load_concurrency', type=int, default=1, help='Max workers using NPU concurrently (loading+warmup). Use 1 for constrained NPU, 2-3 for powerful NPU')
+    parser.add_argument('--timeout', type=int, default=900, help='Timeout (seconds) per worker startup phase')
     args = parser.parse_args()
 
     _manager = mp.Manager()
     task_queue = _manager.Queue(maxsize=args.num_workers * 2)
     ready_queue = _manager.Queue()
-    start_warmup_queues = [_manager.Queue() for _ in range(args.num_workers)]
+    warmup_signal = _manager.Queue()
+    load_semaphore = _manager.Queue(maxsize=args.num_workers)
+    for _ in range(args.load_concurrency):
+        load_semaphore.put('token')
     _task_queue = task_queue
     _server_state['num_workers'] = args.num_workers
 
-    logger.info(f"Spawning {args.num_workers} worker processes (model_dir={args.model_dir})...")
+    logger.info(f"Spawning {args.num_workers} worker processes (model_dir={args.model_dir}, load_concurrency={args.load_concurrency})...")
     for i in range(args.num_workers):
         p = mp.Process(
             target=worker_process,
-            args=(i, args.model_dir, task_queue, ready_queue, args.warmup_times, start_warmup_queues[i]),
+            args=(i, args.model_dir, task_queue, ready_queue, warmup_signal, load_semaphore),
             daemon=True,
         )
         p.start()
         _worker_processes.append(p)
         logger.info(f"[W-{i}] Started (PID: {p.pid})")
 
-    logger.info("Sequential warmup: workers load model concurrently, warm up one at a time")
+    logger.info(f"Sequential warmup: workers load+warmup one at a time (load_concurrency={args.load_concurrency})")
     for i in range(args.num_workers):
-        logger.info(f"[W-{i}] Triggering warmup...")
-        start_warmup_queues[i].put('start')
+        logger.info(f"Warmup slot {i}: sending warmup signal...")
+        warmup_signal.put('start')
         try:
-            signal = ready_queue.get(timeout=900)
+            signal = ready_queue.get(timeout=args.timeout)
         except queue.Empty:
-            logger.error(f"Timeout waiting for worker {i} startup (15min)")
+            logger.error(f"Timeout waiting for worker startup ({args.timeout // 60}min)")
             for p in _worker_processes:
                 p.terminate()
             sys.exit(1)
@@ -629,7 +628,16 @@ echo "[2/4] Created client.py"
 cat << '___DEPLOY_RUN_SERVER_EOF___' > run_server.sh
 #!/bin/bash
 # CosyVoice2 Streaming TTS Server Startup Script
-# Usage: bash run_server.sh [model_dir] [num_workers] [port] [warmup]
+# Usage: bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout]
+
+# ===== Step 0: NPU operator compilation cache & parallel compiler limit =====
+# ASCEND_CACHE_PATH: operator compilation cache for CANN 8.x+
+# TE_PARALLEL_COMPILER: limit parallel operator compilation to reduce NPU contention
+MODEL_DIR="${1:-../weight/CosyVoice2-0.5B}"
+KERNEL_CACHE_DIR="${MODEL_DIR}/kernel_meta"
+mkdir -p "$KERNEL_CACHE_DIR"
+export ASCEND_CACHE_PATH="$KERNEL_CACHE_DIR"
+export TE_PARALLEL_COMPILER="${TE_PARALLEL_COMPILER:-2}"
 
 # ===== Step 1: Find and activate conda environment =====
 CONDA_FOUND=0
@@ -694,6 +702,21 @@ for env_script in \
     fi
 done
 
+# ===== Step 4.5: Add Ascend HCC toolchain C++ include paths =====
+ASCEND_TOOLKIT=/usr/local/Ascend/ascend-toolkit
+if [ -d "$ASCEND_TOOLKIT" ]; then
+    TOOLCHAIN_VER=$(ls -d "$ASCEND_TOOLKIT"/*/toolkit/toolchain/hcc/aarch64-target-linux-gnu/include/c++/* 2>/dev/null | head -1)
+    if [ -n "$TOOLCHAIN_VER" ]; then
+        GCC_VER=$(basename "$TOOLCHAIN_VER")
+        ACTUAL_VER=$(ls "$ASCEND_TOOLKIT" | grep -E '^[0-9]' | head -1)
+        TOOLCHAIN_BASE="$ASCEND_TOOLKIT/$ACTUAL_VER/toolkit/toolchain/hcc/aarch64-target-linux-gnu"
+        export CPLUS_INCLUDE_PATH="$TOOLCHAIN_BASE/include/c++/$GCC_VER:${CPLUS_INCLUDE_PATH:-}"
+        export CPLUS_INCLUDE_PATH="$TOOLCHAIN_BASE/include/c++/$GCC_VER/aarch64-target-linux-gnu:${CPLUS_INCLUDE_PATH:-}"
+        export CPLUS_INCLUDE_PATH="$TOOLCHAIN_BASE/sys-include:${CPLUS_INCLUDE_PATH:-}"
+        echo "Added C++ include paths from Ascend toolchain (GCC $GCC_VER)"
+    fi
+fi
+
 # ===== Step 5: Add shared library paths for spawn child processes =====
 # Critical for pynini/OpenFst, HCCL, and other .so dependencies
 PY_PREFIX=$(python3 -c "import sys; print(sys.prefix)" 2>/dev/null)
@@ -735,24 +758,28 @@ export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 export PYTHONPATH=third_party/Matcha-TTS:$PYTHONPATH
 export PYTHONPATH=transformers/src:$PYTHONPATH
 
-MODEL_DIR="${1:-../weight/CosyVoice2-0.5B}"
 NUM_WORKERS="${2:-2}"
 PORT="${3:-50000}"
-WARMUP="${4:-2}"
+LOAD_CONCURRENCY="${4:-1}"
+TIMEOUT="${5:-900}"
 
 echo "Starting CosyVoice2 Streaming TTS Server"
-echo "  model_dir    = $MODEL_DIR"
-echo "  num_workers  = $NUM_WORKERS"
-echo "  port         = $PORT"
-echo "  warmup       = $WARMUP"
-echo "  NPU device   = $ASCEND_RT_VISIBLE_DEVICES"
+echo "  model_dir        = $MODEL_DIR"
+echo "  num_workers       = $NUM_WORKERS"
+echo "  port              = $PORT"
+echo "  load_concurrency  = $LOAD_CONCURRENCY"
+echo "  timeout           = $TIMEOUT"
+echo "  NPU device        = $ASCEND_RT_VISIBLE_DEVICES"
+echo "  ASCEND_CACHE_PATH     = $ASCEND_CACHE_PATH"
+echo "  TE_PARALLEL_COMPILER  = $TE_PARALLEL_COMPILER"
 echo "  LD_LIBRARY_PATH = $LD_LIBRARY_PATH"
 
 python3 server.py \
     --model_dir="$MODEL_DIR" \
     --num_workers="$NUM_WORKERS" \
     --port="$PORT" \
-    --warmup_times="$WARMUP"
+    --load_concurrency="$LOAD_CONCURRENCY" \
+    --timeout="$TIMEOUT"
 ___DEPLOY_RUN_SERVER_EOF___
 
 chmod +x run_server.sh
@@ -1060,26 +1087,22 @@ echo ""
 echo "=== Deployment complete! ==="
 echo ""
 echo "Files created:"
-echo "  server.py      - Multi-process streaming TTS server (dynamic lib discovery + preload)"
+echo "  server.py      - Multi-process streaming TTS server"
 echo "  client.py      - Test client"
-echo "  run_server.sh  - Startup script (conda search + lib discovery + modelscope patch)"
-echo "  bench_client.py - HTTP并发压测脚本"
-echo ""
-echo "Key changes from previous version:"
-echo "  - server.py: f0/source from UNPADDED speech_feat (accurate); source/speech_feat both zero-padded RIGHT to bucket size for decode/STFT"
-echo "  - server.py: bucket decode with dynamic=False + fullgraph=True + cache_size_limit=16"
-echo "  - server.py: _discover_lib_dirs() finds Python/conda/Ascend/system lib dirs dynamically"
-echo "  - server.py: preloads libhccl.so, libfstmpdtscript.so.26, libfst.so.26 in spawn children"
-echo "  - server.py: added import numpy as np (was missing)"
-echo "  - run_server.sh: conda search checks 7 locations + which conda fallback"
-echo "  - server.py: removed set_device(0), device auto-selected by ASCEND_RT_VISIBLE_DEVICES (matching infer.py)"
-echo "  - server.py: sequential warmup (one worker at a time, avoids NPU competition)"
-echo "  - run_server.sh: ASCEND_RT_VISIBLE_DEVICES no longer overrides user-set value"
+echo "  run_server.sh  - Startup script (conda + Ascend env + lib paths)"
+echo "  bench_client.py - HTTP concurrent benchmark"
 echo ""
 echo "Quick start:"
-echo "  1. Adjust ASCEND_RT_VISIBLE_DEVICES in run_server.sh if needed"
+echo "  1. Adjust ASCEND_RT_VISIBLE_DEVICES if needed"
 echo "  2. Run:  bash run_server.sh ../weight/CosyVoice2-0.5B 2 50000"
 echo "  3. Test: python3 client.py --mode health"
 echo "  4. Test: python3 client.py --mode sft --tts_text '你好世界' --spk_id '中文女'"
 echo "  5. Bench: python3 bench_client.py --concurrency 2 --num_requests 5"
 echo "  6. Auto-probe: python3 bench_client.py --auto_probe --max_concurrency 4 --num_requests 3"
+echo ""
+echo "For constrained NPU environments:"
+echo "  bash run_server.sh ../weight/CosyVoice2-0.5B 6 50000 1 1800"
+echo "  # 6 workers, load_concurrency=1 (serialized loading), timeout=30min"
+echo ""
+echo "Or set TE_PARALLEL_COMPILER=1 for maximum safety:"
+echo "  TE_PARALLEL_COMPILER=1 bash run_server.sh ../weight/CosyVoice2-0.5B 6 50000 1 1800"
