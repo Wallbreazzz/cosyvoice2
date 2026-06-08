@@ -34,10 +34,10 @@ bash deploy.sh
 bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout]
 ```
 
-示例（8 进程、端口 50000）：
+示例（8 进程、端口 50000、同时只有1个worker加载模型、每个worker超时时间900s）：
 
 ```bash
-bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000
+bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 900
 ```
 
 参数说明：
