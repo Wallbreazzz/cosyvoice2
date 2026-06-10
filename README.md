@@ -31,7 +31,7 @@ bash deploy.sh
 ## 启动服务
 
 ```bash
-bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout]
+bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout] [cpu_bind]
 ```
 
 示例（8 进程、端口 50000、同时只有1个worker加载模型、每个worker超时时间900s）：
@@ -40,12 +40,19 @@ bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout]
 bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 900
 ```
 
+手动指定 CPU 绑核（绑定到 NUMA node 0 的 0~11 号核）：
+
+```bash
+bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,10,11
+```
+
 参数说明：
 - `model_dir`：模型目录路径
 - `num_workers`：进程数，默认 2
 - `port`：服务端口，默认 50000
 - `load_concurrency`：最大并发加载数，默认 1（单 NPU 环境建议设为 1）
-- `timeout`：每个 worker 启动超时（秒），默认 900
+- `timeout`：每个 worker 启动超时（秒），默认 1800
+- `cpu_bind`：可选，逗号分隔的 CPU 核编号。为空时自动探测 NUMA 拓扑并绑核
 
 > 如需指定 NPU 卡号，启动前设置 `ASCEND_RT_VISIBLE_DEVICES` 环境变量，如 `export ASCEND_RT_VISIBLE_DEVICES=0`。
 
@@ -152,12 +159,34 @@ python3 bench_client.py --concurrency 8 --num_requests 16 \
 - 每个 Worker 进程独立加载一份模型实例，通过共享队列接收任务
 - Worker 进程顺序预热（避免多进程同时推理导致 NPU 资源竞争）
 
+### 性能优化
+
+服务内置以下性能优化机制：
+
+**CPU 绑核（CPU Affinity）**
+
+自动探测系统 NUMA 拓扑，将所有 Worker 进程和主进程绑定到同一 NUMA node 内的 CPU 核上，避免跨 NUMA 访存和跨 L3 cache 的 IPC 开销。也可通过 `cpu_bind` 参数手动指定核列表。
+
+**NUMA 内存绑定**
+
+启动脚本自动检测 `numactl`，若可用则将进程内存分配绑定到对应的 NUMA node（`--membind`），确保内存访问走本地路径，降低跨 node 访存延迟。
+
+**固定大小线程池**
+
+流式响应的 `run_in_executor` 使用固定大小的 `ThreadPoolExecutor`（`max_workers = num_workers + 4`），避免线程数随 CPU 核数增长导致上下文切换开销增大。
+
+**控制队列优化**
+
+Worker 控制信号（ready/warmup/load_semaphore）使用 `mp.Queue` 替代 `Manager.Queue`，消除 Manager Server 单点 IPC 瓶颈。任务分发和结果回传仍使用 `Manager.Queue` 以支持跨进程 pickle 传递。
+
 ## 性能参考
 
-以下为 8 进程并发、Ascend 910B3 NPU 环境下的参考性能数据：
+以下为 8 进程并发、Ascend 910B3 NPU 环境下的参考性能数据（已启用 CPU 绑核 + NUMA 内存绑定优化）：
 
 | 场景 | 并发数 | 请求数 | 成功率 | 平均RTF | 平均TTFT | QPS |
 |------|--------|--------|--------|---------|----------|-----|
 | SFT 短文本 | 8 | 16 | 100% | 0.567 | 0.505s | 3.78 |
 | SFT 混合文本 | 8 | 16 | 100% | 0.692 | 0.525s | 1.45 |
 | Zero-shot | 8 | 16 | 100% | 0.809 | 1.715s | 1.62 |
+
+> **注意**：在多 NUMA node 的机器上（如 24 核双路），扩容 CPU/内存后若未启用绑核，性能可能反而下降。建议保持默认自动绑核行为，或通过 `cpu_bind` 参数显式指定同一 NUMA node 内的核列表。

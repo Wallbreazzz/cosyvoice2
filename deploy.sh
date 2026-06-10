@@ -124,44 +124,132 @@ def _setup_npu_env():
                     continue
 
 
-def worker_process(worker_id: int, model_path: str, task_queue, ready_queue, warmup_signal, load_semaphore):
+def _discover_numa():
+    numa_nodes = {}
+    node_dir = '/sys/devices/system/node'
     try:
+        if not os.path.isdir(node_dir):
+            return None
+        for entry in sorted(os.listdir(node_dir)):
+            if entry.startswith('node') and entry[4:].isdigit():
+                node_id = int(entry[4:])
+                cpulist_path = os.path.join(node_dir, entry, 'cpulist')
+                if os.path.isfile(cpulist_path):
+                    with open(cpulist_path) as f:
+                        cpulist_str = f.read().strip()
+                    cores = []
+                    for part in cpulist_str.split(','):
+                        if '-' in part:
+                            start, end = part.split('-')
+                            cores.extend(range(int(start), int(end) + 1))
+                        else:
+                            cores.append(int(part))
+                    numa_nodes[node_id] = cores
+        return numa_nodes if numa_nodes else None
+    except Exception as e:
+        logger.warning(f"NUMA discovery failed: {e}")
+        return None
+
+
+def _select_numa_node(numa_info, num_cores_needed):
+    if not numa_info:
+        return None
+    candidates = [(nid, cores) for nid, cores in numa_info.items() if len(cores) >= num_cores_needed]
+    if candidates:
+        candidates.sort(key=lambda x: len(x[1]))
+        return candidates[0][0]
+    best = max(numa_info.items(), key=lambda x: len(x[1]))
+    logger.warning(f"No NUMA node with >= {num_cores_needed} cores, using node {best[0]} ({len(best[1])} cores)")
+    return best[0]
+
+
+def _allocate_cores(numa_node_id, numa_info, num_workers):
+    cores = numa_info[numa_node_id]
+    worker_cores = cores[:num_workers]
+    main_cores = cores[num_workers:num_workers + 4]
+    return {'workers': worker_cores, 'main': main_cores, 'numa_node': numa_node_id}
+
+
+def worker_process(worker_id: int, model_path: str, task_queue, ready_queue, warmup_signal, load_semaphore, cpu_bind=None):
+    try:
+        import time as _time
+
+        if cpu_bind and worker_id < len(cpu_bind):
+            os.sched_setaffinity(0, {cpu_bind[worker_id]})
+            logger.info(f"[W-{worker_id}] Bound to CPU core {cpu_bind[worker_id]}")
+
         logger.info(f"[W-{worker_id}] Waiting for load slot...")
         load_semaphore.get()
         logger.info(f"[W-{worker_id}] Acquired load slot, starting initialization...")
 
+        _t0 = _time.time()
         _setup_npu_env()
+        logger.info(f"[W-{worker_id}] _setup_npu_env done ({_time.time()-_t0:.1f}s)")
 
+        _t1 = _time.time()
         import torch
         import torch_npu
         import torch.nn.functional as F
         from torch_npu.contrib import transfer_to_npu
         from cosyvoice.cli.cosyvoice import CosyVoice2
         from cosyvoice.utils.file_utils import load_wav
+        logger.info(f"[W-{worker_id}] imports done ({_time.time()-_t1:.1f}s)")
 
         torch_npu.npu.set_compile_mode(jit_compile=False)
 
+        _t2 = _time.time()
+        logger.info(f"[W-{worker_id}] NPU diag: matmul test...")
+        with torch.no_grad():
+            _a = torch.randn(256, 256, device='npu:0')
+            _b = torch.randn(256, 256, device='npu:0')
+            _c = torch.mm(_a, _b)
+            torch.npu.synchronize()
+            del _a, _b, _c
+        logger.info(f"[W-{worker_id}] NPU diag: matmul OK ({_time.time()-_t2:.1f}s)")
+
+        _t3 = _time.time()
         logger.info(f"[W-{worker_id}] Loading model from {model_path}...")
         cosyvoice = CosyVoice2(model_path, load_om=True, fp16=True)
         cosyvoice.model.llm.eval()
         cosyvoice.model.llm.llm.model.model.half()
+        logger.info(f"[W-{worker_id}] Model loaded ({_time.time()-_t3:.1f}s)")
 
         sample_rate = cosyvoice.sample_rate
         spk_list = cosyvoice.list_available_spks()
 
-        logger.info(f"[W-{worker_id}] Model loaded, waiting for warmup signal...")
+        logger.info(f"[W-{worker_id}] Waiting for warmup signal...")
         warmup_signal.get()
 
-        with torch.no_grad():
-            logger.info(f"[W-{worker_id}] Warming up with 1 real inference...")
-            next(cosyvoice.inference_sft('你好世界。', '中文女', stream=True))
-            logger.info(f"[W-{worker_id}] Warmup done")
+        skip_warmup = os.environ.get('SKIP_WARMUP', '').lower() in ('1', 'true', 'yes')
+        if skip_warmup:
+            logger.info(f"[W-{worker_id}] SKIP_WARMUP set, skipping warmup")
+        else:
+            with torch.no_grad():
+                _tw = _time.time()
+                logger.info(f"[W-{worker_id}] Warmup: frontend text_normalize...")
+                _norm_texts = list(cosyvoice.frontend.text_normalize('你好世界。', split=True, text_frontend=True))
+                logger.info(f"[W-{worker_id}] Warmup: text_normalize done ({_time.time()-_tw:.1f}s), sentences={len(_norm_texts)}")
+
+                logger.info(f"[W-{worker_id}] Warmup: frontend_sft...")
+                _tfe = _time.time()
+                _model_input = cosyvoice.frontend.frontend_sft(_norm_texts[0], '中文女')
+                logger.info(f"[W-{worker_id}] Warmup: frontend_sft done ({_time.time()-_tfe:.1f}s)")
+
+                logger.info(f"[W-{worker_id}] Warmup: LLM first token generation (may take 10-30min on first run)...")
+                _tllm = _time.time()
+                _token_count = 0
+                _gen = cosyvoice.model.tts(**_model_input, stream=True, speed=1.0)
+                for _chunk in _gen:
+                    _token_count += 1
+                    _elapsed = _time.time() - _tllm
+                    logger.info(f"[W-{worker_id}] Warmup: chunk #{_token_count} yielded ({_elapsed:.1f}s elapsed)")
+                logger.info(f"[W-{worker_id}] Warmup done (total {_time.time()-_tw:.1f}s, {_token_count} chunks)")
 
         load_semaphore.put('token')
-        logger.info(f"[W-{worker_id}] Released load slot (after warmup).")
+        logger.info(f"[W-{worker_id}] Released load slot.")
 
         ready_queue.put(('ready', worker_id, spk_list, sample_rate))
-        logger.info(f"[W-{worker_id}] Service ready")
+        logger.info(f"[W-{worker_id}] Service ready (total init {_time.time()-_t0:.1f}s)")
 
         while True:
             task = task_queue.get()
@@ -235,7 +323,7 @@ async def _stream_from_queue(output_queue, chunk_timeout=60):
     while True:
         try:
             chunk = await loop.run_in_executor(
-                None, lambda: output_queue.get(timeout=chunk_timeout)
+                _executor, lambda: output_queue.get(timeout=chunk_timeout)
             )
         except queue.Empty:
             logger.warning("Stream timeout: no chunk for %ds", chunk_timeout)
@@ -402,24 +490,59 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=2, help='Number of worker processes (each loads one model instance)')
     parser.add_argument('--port', type=int, default=50000, help='Server port')
     parser.add_argument('--load_concurrency', type=int, default=1, help='Max workers using NPU concurrently (loading+warmup). Use 1 for constrained NPU, 2-3 for powerful NPU')
-    parser.add_argument('--timeout', type=int, default=900, help='Timeout (seconds) per worker startup phase')
+    parser.add_argument('--timeout', type=int, default=1800, help='Timeout (seconds) per worker startup phase')
+    parser.add_argument('--cpu_bind', type=str, default='',
+        help='Comma-separated CPU core IDs for binding (e.g. "0,1,2,3,4,5,6,7,8,9,10,11"). Empty = auto-detect from NUMA topology')
     args = parser.parse_args()
+
+    import concurrent.futures
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers + 4)
 
     _manager = mp.Manager()
     task_queue = _manager.Queue(maxsize=args.num_workers * 2)
-    ready_queue = _manager.Queue()
-    warmup_signal = _manager.Queue()
-    load_semaphore = _manager.Queue(maxsize=args.num_workers)
+    ready_queue = mp.Queue()
+    warmup_signal = mp.Queue()
+    load_semaphore = mp.Queue(maxsize=args.num_workers)
     for _ in range(args.load_concurrency):
         load_semaphore.put('token')
     _task_queue = task_queue
     _server_state['num_workers'] = args.num_workers
 
+    cpu_bind_list = []
+    main_cores = []
+    numa_node_id = None
+    if args.cpu_bind:
+        cpu_bind_list = [int(x.strip()) for x in args.cpu_bind.split(',')]
+        if len(cpu_bind_list) >= args.num_workers:
+            main_cores = cpu_bind_list[args.num_workers:]
+            cpu_bind_list = cpu_bind_list[:args.num_workers]
+        logger.info(f"CPU binding (manual): workers={cpu_bind_list}, main={main_cores}")
+    else:
+        numa_info = _discover_numa()
+        if numa_info:
+            cores_needed = args.num_workers + 4
+            numa_node_id = _select_numa_node(numa_info, cores_needed)
+            if numa_node_id is not None:
+                alloc = _allocate_cores(numa_node_id, numa_info, args.num_workers)
+                cpu_bind_list = alloc['workers']
+                main_cores = alloc['main']
+                logger.info(f"NUMA auto-detect: node={numa_node_id}, "
+                            f"worker_cores={cpu_bind_list}, main_cores={main_cores}")
+        else:
+            logger.info("NUMA topology not available, skipping CPU binding")
+
+    if main_cores:
+        try:
+            os.sched_setaffinity(0, set(main_cores))
+            logger.info(f"Main process bound to CPU cores {main_cores}")
+        except Exception as e:
+            logger.warning(f"Failed to bind main process to {main_cores}: {e}")
+
     logger.info(f"Spawning {args.num_workers} worker processes (model_dir={args.model_dir}, load_concurrency={args.load_concurrency})...")
     for i in range(args.num_workers):
         p = mp.Process(
             target=worker_process,
-            args=(i, args.model_dir, task_queue, ready_queue, warmup_signal, load_semaphore),
+            args=(i, args.model_dir, task_queue, ready_queue, warmup_signal, load_semaphore, cpu_bind_list),
             daemon=True,
         )
         p.start()
@@ -463,6 +586,7 @@ if __name__ == '__main__':
             p.join(timeout=10)
             if p.is_alive():
                 p.terminate()
+        _executor.shutdown(wait=False)
         logger.info("Server shutdown complete")
 ___DEPLOY_SERVER_PY_EOF___
 
@@ -761,7 +885,63 @@ export PYTHONPATH=transformers/src:$PYTHONPATH
 NUM_WORKERS="${2:-2}"
 PORT="${3:-50000}"
 LOAD_CONCURRENCY="${4:-1}"
-TIMEOUT="${5:-900}"
+TIMEOUT="${5:-1800}"
+CPU_BIND="${6:-}"
+
+# ===== Step 7: NUMA-aware memory binding via numactl =====
+NUMACTL_CMD=""
+if command -v numactl &>/dev/null; then
+    NUMA_NODE=""
+    CORES_NEEDED=$((NUM_WORKERS + 4))
+    if [ -n "$CPU_BIND" ]; then
+        FIRST_CORE=$(echo "$CPU_BIND" | cut -d',' -f1)
+        for node_dir in /sys/devices/system/node/node*; do
+            if [ -d "$node_dir" ] && [ -f "$node_dir/cpulist" ]; then
+                if grep -qw "$FIRST_CORE" "$(echo "$node_dir/cpulist" | sed 's/,/ /g; s/-/ /' 2>/dev/null)" 2>/dev/null || \
+                   grep -q "$FIRST_CORE" "$node_dir/cpulist" 2>/dev/null; then
+                    NUMA_NODE=$(basename "$node_dir" | sed 's/node//')
+                    break
+                fi
+            fi
+        done
+        [ -z "$NUMA_NODE" ] && NUMA_NODE=$(cat /sys/devices/system/cpu/cpu${FIRST_CORE}/topology/physical_package_id 2>/dev/null || echo "0")
+    else
+        BEST_NODE=""
+        BEST_COUNT=999999
+        for node_dir in /sys/devices/system/node/node*; do
+            if [ -d "$node_dir" ] && [ -f "$node_dir/cpulist" ]; then
+                CORES=$(cat "$node_dir/cpulist" 2>/dev/null)
+                COUNT=0
+                IFS=',' read -ra RANGES <<< "$CORES"
+                for RANGE in "${RANGES[@]}"; do
+                    if [[ "$RANGE" == *-* ]]; then
+                        START=$(echo "$RANGE" | cut -d'-' -f1)
+                        END=$(echo "$RANGE" | cut -d'-' -f2)
+                        COUNT=$((COUNT + END - START + 1))
+                    else
+                        COUNT=$((COUNT + 1))
+                    fi
+                done
+                if [ "$COUNT" -ge "$CORES_NEEDED" ] && [ "$COUNT" -lt "$BEST_COUNT" ]; then
+                    BEST_COUNT=$COUNT
+                    BEST_NODE=$(basename "$node_dir" | sed 's/node//')
+                fi
+            fi
+        done
+        if [ -z "$BEST_NODE" ]; then
+            BEST_NODE=$(ls -d /sys/devices/system/node/node* 2>/dev/null | head -1 | sed 's|.*/node||')
+        fi
+        NUMA_NODE="${BEST_NODE:-0}"
+    fi
+    if numactl --hardware 2>/dev/null | grep -q "node ${NUMA_NODE}"; then
+        NUMACTL_CMD="numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE}"
+        echo "NUMA binding: $NUMACTL_CMD"
+    else
+        echo "WARNING: numactl available but NUMA node ${NUMA_NODE} not found, skipping NUMA binding"
+    fi
+else
+    echo "WARNING: numactl not found, skipping NUMA memory binding"
+fi
 
 echo "Starting CosyVoice2 Streaming TTS Server"
 echo "  model_dir        = $MODEL_DIR"
@@ -772,14 +952,22 @@ echo "  timeout           = $TIMEOUT"
 echo "  NPU device        = $ASCEND_RT_VISIBLE_DEVICES"
 echo "  ASCEND_CACHE_PATH     = $ASCEND_CACHE_PATH"
 echo "  TE_PARALLEL_COMPILER  = $TE_PARALLEL_COMPILER"
+echo "  cpu_bind        = ${CPU_BIND:-auto-detect NUMA}"
+echo "  numactl         = ${NUMACTL_CMD:-disabled}"
 echo "  LD_LIBRARY_PATH = $LD_LIBRARY_PATH"
 
-python3 server.py \
+CPU_BIND_ARG=""
+if [ -n "$CPU_BIND" ]; then
+    CPU_BIND_ARG="--cpu_bind=$CPU_BIND"
+fi
+
+$NUMACTL_CMD python3 server.py \
     --model_dir="$MODEL_DIR" \
     --num_workers="$NUM_WORKERS" \
     --port="$PORT" \
     --load_concurrency="$LOAD_CONCURRENCY" \
-    --timeout="$TIMEOUT"
+    --timeout="$TIMEOUT" \
+    $CPU_BIND_ARG
 ___DEPLOY_RUN_SERVER_EOF___
 
 chmod +x run_server.sh
@@ -1095,10 +1283,14 @@ echo ""
 echo "Quick start:"
 echo "  1. Adjust ASCEND_RT_VISIBLE_DEVICES if needed"
 echo "  2. Run:  bash run_server.sh ../weight/CosyVoice2-0.5B 2 50000"
+echo "     (auto-detects NUMA topology and binds CPU cores + memory)"
 echo "  3. Test: python3 client.py --mode health"
 echo "  4. Test: python3 client.py --mode sft --tts_text '你好世界' --spk_id '中文女'"
 echo "  5. Bench: python3 bench_client.py --concurrency 2 --num_requests 5"
 echo "  6. Auto-probe: python3 bench_client.py --auto_probe --max_concurrency 4 --num_requests 3"
+echo ""
+echo "With manual CPU binding (e.g. bind to cores 0-11 on NUMA node 0):"
+echo "  bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,10,11"
 echo ""
 echo "For constrained NPU environments:"
 echo "  bash run_server.sh ../weight/CosyVoice2-0.5B 6 50000 1 1800"
