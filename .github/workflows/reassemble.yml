@@ -3,11 +3,16 @@ name: Reassemble benchmark wav files
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   reassemble:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Reassemble chunks to wav files
         run: |
@@ -42,6 +47,6 @@ jobs:
           git config user.name "Wallbreazzz"
           git config user.email "110282866+Wallbreazzz@users.noreply.github.com"
           git add bench_output/
-          git rm -r chunks/
-          git commit -m "Reassemble benchmark wav files from chunks"
+          git rm -r --cached chunks/ || true
+          git commit -m "Reassemble benchmark wav files from chunks" || echo "Nothing to commit"
           git push
