@@ -1,0 +1,47 @@
+name: Reassemble benchmark wav files
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reassemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reassemble chunks to wav files
+        run: |
+          python3 -c "
+          import base64, json, os
+
+          with open('chunks/manifest.json') as f:
+              manifest = json.load(f)
+
+          os.makedirs('bench_output', exist_ok=True)
+
+          for fname, num_chunks in manifest.items():
+              parts = []
+              for i in range(num_chunks):
+                  chunk_name = f'bench_{int(fname.split(\"_\")[1].split(\".\")[0]):03d}_part{i:03d}.txt'
+                  with open(f'chunks/{chunk_name}', 'r') as f:
+                      parts.append(f.read())
+              b64_data = ''.join(parts)
+              wav_data = base64.b64decode(b64_data)
+              with open(f'bench_output/{fname}', 'wb') as f:
+                  f.write(wav_data)
+              print(f'Restored {fname}: {len(wav_data)} bytes')
+
+          print(f'Done: {len(manifest)} files restored')
+          "
+
+      - name: Remove chunks directory
+        run: rm -rf chunks
+
+      - name: Commit and push
+        run: |
+          git config user.name "Wallbreazzz"
+          git config user.email "110282866+Wallbreazzz@users.noreply.github.com"
+          git add bench_output/
+          git rm -r chunks/
+          git commit -m "Reassemble benchmark wav files from chunks"
+          git push
