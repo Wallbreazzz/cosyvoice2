@@ -19,7 +19,7 @@
 bash deploy.sh
 ```
 
-脚本将自动生成以下 4 个文件：
+脚本将自动生成以下 5 个文件，并修改 2 个模型代码文件：
 
 | 文件 | 说明 |
 |------|------|
@@ -27,17 +27,28 @@ bash deploy.sh
 | `client.py` | 测试客户端 |
 | `run_server.sh` | 启动脚本（自动查找 conda + 加载 Ascend NPU 环境） |
 | `bench_client.py` | HTTP 并发压测脚本 |
+| `test_seeds.sh` | 音色调优脚本（遍历不同 seed 寻找最佳音色） |
+
+模型代码修改：
+- `cosyvoice/cli/model.py`：在 `CosyVoice2Model.tts()` 中添加 seed 支持
+- `cosyvoice/cli/cosyvoice.py`：在所有推理方法中添加 seed 参数透传
 
 ## 启动服务
 
 ```bash
-bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout] [cpu_bind]
+bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout] [cpu_bind] [seed]
 ```
 
-示例（8 进程、端口 50000、同时只有1个worker加载模型、每个worker超时时间900s）：
+示例（8 进程、端口 50000）：
 
 ```bash
-bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 900
+bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000
+```
+
+指定 seed（默认 9）：
+
+```bash
+bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 "" 42
 ```
 
 手动指定 CPU 绑核（绑定到 NUMA node 0 的 0~11 号核）：
@@ -53,6 +64,7 @@ bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,
 - `load_concurrency`：最大并发加载数，默认 1（单 NPU 环境建议设为 1）
 - `timeout`：每个 worker 启动超时（秒），默认 1800
 - `cpu_bind`：可选，逗号分隔的 CPU 核编号。为空时自动探测 NUMA 拓扑并绑核
+- `seed`：随机种子，默认 9。固定 seed 可确保相同文本生成完全一致的音频
 
 > 如需指定 NPU 卡号，启动前设置 `ASCEND_RT_VISIBLE_DEVICES` 环境变量，如 `export ASCEND_RT_VISIBLE_DEVICES=0`。
 
@@ -83,6 +95,7 @@ bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,
 | `spk_id` | string | 是 | 说话人 ID（如"中文女"） |
 | `stream` | bool | 否 | 是否流式，默认 true |
 | `speed` | float | 否 | 语速，默认 1.0 |
+| `seed` | int | 否 | 随机种子，默认 9。固定 seed 可确保相同文本生成完全一致的音频 |
 
 **Zero-shot 模式**
 
@@ -93,6 +106,7 @@ bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,
 | `prompt_wav` | file | 是 | 参考音频文件 |
 | `stream` | bool | 否 | 是否流式 |
 | `speed` | float | 否 | 语速 |
+| `seed` | int | 否 | 随机种子，默认 9 |
 
 **Cross-lingual 模式**
 
@@ -101,6 +115,7 @@ bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,
 | `tts_text` | string | 是 | 待合成文本 |
 | `prompt_wav` | file | 是 | 参考音频文件 |
 | `stream` / `speed` | - | 否 | 同上 |
+| `seed` | int | 否 | 随机种子，默认 9 |
 
 **Instruct2 模式**
 
@@ -110,6 +125,7 @@ bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,
 | `instruct_text` | string | 是 | 指令文本 |
 | `prompt_wav` | file | 是 | 参考音频文件 |
 | `stream` / `speed` | - | 否 | 同上 |
+| `seed` | int | 否 | 随机种子，默认 9 |
 
 ## 客户端测试
 
@@ -123,12 +139,38 @@ python3 client.py --mode list_spks
 # SFT 模式
 python3 client.py --mode sft --tts_text '你好世界' --spk_id '中文女'
 
+# SFT 模式（指定 seed）
+python3 client.py --mode sft --tts_text '你好世界' --spk_id '中文女' --seed 42
+
 # Zero-shot 模式
 python3 client.py --mode zero_shot \
   --tts_text '收到好友从远方寄来的生日礼物' \
   --prompt_text '希望你以后能够做的比我还好呦。' \
   --prompt_wav asset/zero_shot_prompt.wav
 ```
+
+## 音色调优
+
+CosyVoice2 模型的 LLM 采样和 Flow 模型噪声生成依赖随机数。通过固定 `seed` 参数可以消除随机性，确保相同文本每次生成完全一致的音频。
+
+不同 seed 值会产生不同的音色表现。使用 `test_seeds.sh` 可以批量测试不同 seed，找到最适合业务的音色：
+
+```bash
+# 测试 seed 0~20，每个 seed 生成 1 条音频
+bash test_seeds.sh 0 20
+
+# 音频保存在 seed_test/ 目录下
+# 逐一试听，选择音色最佳的 seed 值
+```
+
+找到满意的 seed 后，将其设为服务启动的默认值：
+
+```bash
+# 例如最佳 seed 为 15
+bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 "" 15
+```
+
+> **注意**：seed 与说话人（`spk_id`）是独立的。同一个 seed 在不同说话人上的音色表现可能不同。如需多个说话人都达到最佳效果，建议分别为每个说话人测试最佳 seed。
 
 ## 并发压测
 
@@ -145,6 +187,9 @@ python3 bench_client.py --concurrency 8 --num_requests 16 \
   --prompt_text "希望你以后能够做的比我还好呦。" \
   --prompt_wav asset/zero_shot_prompt.wav \
   --output_dir bench_zero_shot
+
+# 指定 seed 压测
+python3 bench_client.py --concurrency 8 --num_requests 16 --seed 42 --output_dir bench_seed42
 ```
 
 压测结果输出指标：

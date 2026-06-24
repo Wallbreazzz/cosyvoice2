@@ -3,7 +3,8 @@
 # Run from within CosyVoice directory:
 #   cd CosyVoice && bash deploy.sh
 #
-# Creates 4 files: server.py, client.py, run_server.sh, bench_client.py
+# Creates 5 files: server.py, client.py, run_server.sh, bench_client.py, test_seeds.sh
+# Patches 2 model files: cosyvoice/cli/model.py, cosyvoice/cli/cosyvoice.py
 # Uses heredoc with single-quoted delimiters to prevent shell expansion.
 
 echo "=== CosyVoice2 Multi-Process Streaming TTS Server Deployment ==="
@@ -263,31 +264,32 @@ def worker_process(worker_id: int, model_path: str, task_queue, ready_queue, war
             mode = task['mode']
             stream = task.get('stream', True)
             speed = task.get('speed', 1.0)
+            seed = task.get('seed', 9)
 
             try:
                 with torch.no_grad():
                     if mode == 'sft':
                         gen = cosyvoice.inference_sft(
                             task['tts_text'], task['spk_id'],
-                            stream=stream, speed=speed,
+                            stream=stream, speed=speed, seed=seed,
                         )
                     elif mode == 'zero_shot':
                         prompt_speech = load_wav(task['prompt_wav_path'], 16000)
                         gen = cosyvoice.inference_zero_shot(
                             task['tts_text'], task['prompt_text'],
-                            prompt_speech, stream=stream, speed=speed,
+                            prompt_speech, stream=stream, speed=speed, seed=seed,
                         )
                     elif mode == 'cross_lingual':
                         prompt_speech = load_wav(task['prompt_wav_path'], 16000)
                         gen = cosyvoice.inference_cross_lingual(
                             task['tts_text'], prompt_speech,
-                            stream=stream, speed=speed,
+                            stream=stream, speed=speed, seed=seed,
                         )
                     elif mode == 'instruct2':
                         prompt_speech = load_wav(task['prompt_wav_path'], 16000)
                         gen = cosyvoice.inference_instruct2(
                             task['tts_text'], task['instruct_text'],
-                            prompt_speech, stream=stream, speed=speed,
+                            prompt_speech, stream=stream, speed=speed, seed=seed,
                         )
                     else:
                         raise ValueError(f"Unknown inference mode: {mode}")
@@ -383,6 +385,7 @@ async def inference_sft(
     spk_id: str = Form(),
     stream: bool = Form(True),
     speed: float = Form(1.0),
+    seed: int = Form(9),
 ):
     output_queue = _manager.Queue()
     task = {
@@ -391,6 +394,7 @@ async def inference_sft(
         'spk_id': spk_id,
         'stream': stream,
         'speed': speed,
+        'seed': seed,
         'output_queue': output_queue,
     }
     try:
@@ -407,6 +411,7 @@ async def inference_zero_shot(
     prompt_wav: UploadFile = File(),
     stream: bool = Form(True),
     speed: float = Form(1.0),
+    seed: int = Form(9),
 ):
     tmp_path = await _save_upload_to_temp(prompt_wav)
     output_queue = _manager.Queue()
@@ -418,6 +423,7 @@ async def inference_zero_shot(
         'cleanup_wav': True,
         'stream': stream,
         'speed': speed,
+        'seed': seed,
         'output_queue': output_queue,
     }
     try:
@@ -434,6 +440,7 @@ async def inference_cross_lingual(
     prompt_wav: UploadFile = File(),
     stream: bool = Form(True),
     speed: float = Form(1.0),
+    seed: int = Form(9),
 ):
     tmp_path = await _save_upload_to_temp(prompt_wav)
     output_queue = _manager.Queue()
@@ -444,6 +451,7 @@ async def inference_cross_lingual(
         'cleanup_wav': True,
         'stream': stream,
         'speed': speed,
+        'seed': seed,
         'output_queue': output_queue,
     }
     try:
@@ -461,6 +469,7 @@ async def inference_instruct2(
     prompt_wav: UploadFile = File(),
     stream: bool = Form(True),
     speed: float = Form(1.0),
+    seed: int = Form(9),
 ):
     tmp_path = await _save_upload_to_temp(prompt_wav)
     output_queue = _manager.Queue()
@@ -472,6 +481,7 @@ async def inference_instruct2(
         'cleanup_wav': True,
         'stream': stream,
         'speed': speed,
+        'seed': seed,
         'output_queue': output_queue,
     }
     try:
@@ -493,6 +503,7 @@ if __name__ == '__main__':
     parser.add_argument('--timeout', type=int, default=1800, help='Timeout (seconds) per worker startup phase')
     parser.add_argument('--cpu_bind', type=str, default='',
         help='Comma-separated CPU core IDs for binding (e.g. "0,1,2,3,4,5,6,7,8,9,10,11"). Empty = auto-detect from NUMA topology')
+    parser.add_argument('--seed', type=int, default=9, help='Random seed for deterministic output (default 9)')
     args = parser.parse_args()
 
     import concurrent.futures
@@ -507,6 +518,7 @@ if __name__ == '__main__':
         load_semaphore.put('token')
     _task_queue = task_queue
     _server_state['num_workers'] = args.num_workers
+    _server_state['seed'] = args.seed
 
     cpu_bind_list = []
     main_cores = []
@@ -575,6 +587,7 @@ if __name__ == '__main__':
 
     logger.info(f"All {args.num_workers} workers ready. Starting HTTP server on :{args.port}")
     logger.info(f"Endpoints: /health /list_spks /inference_sft /inference_zero_shot /inference_cross_lingual /inference_instruct2")
+    logger.info(f"Default seed: {args.seed}")
 
     try:
         uvicorn.run(app, host="0.0.0.0", port=args.port)
@@ -590,7 +603,7 @@ if __name__ == '__main__':
         logger.info("Server shutdown complete")
 ___DEPLOY_SERVER_PY_EOF___
 
-echo "[1/4] Created server.py"
+echo "[1/5] Created server.py"
 
 # --- client.py ---
 cat << '___DEPLOY_CLIENT_PY_EOF___' > client.py
@@ -645,49 +658,53 @@ def _stream_request(url, data, files=None, output_path='output.wav'):
         logger.warning("No audio data received")
 
 
-def sft_request(host, port, tts_text, spk_id, stream, speed, output):
+def sft_request(host, port, tts_text, spk_id, stream, speed, output, seed=9):
     url = f"http://{host}:{port}/inference_sft"
     data = {
         'tts_text': tts_text,
         'spk_id': spk_id,
         'stream': str(stream).lower(),
         'speed': str(speed),
+        'seed': str(seed),
     }
     _stream_request(url, data, output_path=output)
 
 
-def zero_shot_request(host, port, tts_text, prompt_text, prompt_wav, stream, speed, output):
+def zero_shot_request(host, port, tts_text, prompt_text, prompt_wav, stream, speed, output, seed=9):
     url = f"http://{host}:{port}/inference_zero_shot"
     data = {
         'tts_text': tts_text,
         'prompt_text': prompt_text,
         'stream': str(stream).lower(),
         'speed': str(speed),
+        'seed': str(seed),
     }
     files = {'prompt_wav': open(prompt_wav, 'rb')}
     _stream_request(url, data, files=files, output_path=output)
     files['prompt_wav'].close()
 
 
-def cross_lingual_request(host, port, tts_text, prompt_wav, stream, speed, output):
+def cross_lingual_request(host, port, tts_text, prompt_wav, stream, speed, output, seed=9):
     url = f"http://{host}:{port}/inference_cross_lingual"
     data = {
         'tts_text': tts_text,
         'stream': str(stream).lower(),
         'speed': str(speed),
+        'seed': str(seed),
     }
     files = {'prompt_wav': open(prompt_wav, 'rb')}
     _stream_request(url, data, files=files, output_path=output)
     files['prompt_wav'].close()
 
 
-def instruct2_request(host, port, tts_text, instruct_text, prompt_wav, stream, speed, output):
+def instruct2_request(host, port, tts_text, instruct_text, prompt_wav, stream, speed, output, seed=9):
     url = f"http://{host}:{port}/inference_instruct2"
     data = {
         'tts_text': tts_text,
         'instruct_text': instruct_text,
         'stream': str(stream).lower(),
         'speed': str(speed),
+        'seed': str(seed),
     }
     files = {'prompt_wav': open(prompt_wav, 'rb')}
     _stream_request(url, data, files=files, output_path=output)
@@ -730,6 +747,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default='output.wav')
     parser.add_argument('--stream', type=bool, default=True)
     parser.add_argument('--speed', type=float, default=1.0)
+    parser.add_argument('--seed', type=int, default=9, help='Random seed for deterministic output (default 9)')
     args = parser.parse_args()
 
     if args.mode == 'health':
@@ -737,22 +755,22 @@ if __name__ == '__main__':
     elif args.mode == 'list_spks':
         list_spks(args.host, args.port)
     elif args.mode == 'sft':
-        sft_request(args.host, args.port, args.tts_text, args.spk_id, args.stream, args.speed, args.output)
+        sft_request(args.host, args.port, args.tts_text, args.spk_id, args.stream, args.speed, args.output, args.seed)
     elif args.mode == 'zero_shot':
-        zero_shot_request(args.host, args.port, args.tts_text, args.prompt_text, args.prompt_wav, args.stream, args.speed, args.output)
+        zero_shot_request(args.host, args.port, args.tts_text, args.prompt_text, args.prompt_wav, args.stream, args.speed, args.output, args.seed)
     elif args.mode == 'cross_lingual':
-        cross_lingual_request(args.host, args.port, args.tts_text, args.prompt_wav, args.stream, args.speed, args.output)
+        cross_lingual_request(args.host, args.port, args.tts_text, args.prompt_wav, args.stream, args.speed, args.output, args.seed)
     elif args.mode == 'instruct2':
-        instruct2_request(args.host, args.port, args.tts_text, args.instruct_text, args.prompt_wav, args.stream, args.speed, args.output)
+        instruct2_request(args.host, args.port, args.tts_text, args.instruct_text, args.prompt_wav, args.stream, args.speed, args.output, args.seed)
 ___DEPLOY_CLIENT_PY_EOF___
 
-echo "[2/4] Created client.py"
+echo "[2/5] Created client.py"
 
 # --- run_server.sh ---
 cat << '___DEPLOY_RUN_SERVER_EOF___' > run_server.sh
 #!/bin/bash
 # CosyVoice2 Streaming TTS Server Startup Script
-# Usage: bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout]
+# Usage: bash run_server.sh [model_dir] [num_workers] [port] [load_concurrency] [timeout] [cpu_bind] [seed]
 
 # ===== Step 0: NPU operator compilation cache & parallel compiler limit =====
 # ASCEND_CACHE_PATH: operator compilation cache for CANN 8.x+
@@ -887,6 +905,7 @@ PORT="${3:-50000}"
 LOAD_CONCURRENCY="${4:-1}"
 TIMEOUT="${5:-1800}"
 CPU_BIND="${6:-}"
+SEED="${7:-9}"
 
 # ===== Step 7: NUMA-aware memory binding via numactl =====
 NUMACTL_CMD=""
@@ -949,6 +968,7 @@ echo "  num_workers       = $NUM_WORKERS"
 echo "  port              = $PORT"
 echo "  load_concurrency  = $LOAD_CONCURRENCY"
 echo "  timeout           = $TIMEOUT"
+echo "  seed              = $SEED"
 echo "  NPU device        = $ASCEND_RT_VISIBLE_DEVICES"
 echo "  ASCEND_CACHE_PATH     = $ASCEND_CACHE_PATH"
 echo "  TE_PARALLEL_COMPILER  = $TE_PARALLEL_COMPILER"
@@ -967,11 +987,12 @@ $NUMACTL_CMD python3 server.py \
     --port="$PORT" \
     --load_concurrency="$LOAD_CONCURRENCY" \
     --timeout="$TIMEOUT" \
+    --seed="$SEED" \
     $CPU_BIND_ARG
 ___DEPLOY_RUN_SERVER_EOF___
 
 chmod +x run_server.sh
-echo "[3/4] Created run_server.sh (executable)"
+echo "[3/5] Created run_server.sh (executable)"
 
 # --- bench_client.py ---
 cat << '___DEPLOY_BENCH_EOF___' > bench_client.py
@@ -1013,13 +1034,14 @@ all_results = []
 
 
 def send_request(req_id, host, port, mode, tts_text, spk_id, output_dir,
-                 prompt_text=None, prompt_wav=None, instruct_text=None):
+                 prompt_text=None, prompt_wav=None, instruct_text=None, seed=9):
     url = f"http://{host}:{port}/inference_{mode}"
     data = {
         'tts_text': tts_text,
         'spk_id': spk_id,
         'stream': 'true',
         'speed': '1.0',
+        'seed': str(seed),
     }
     files = None
 
@@ -1106,10 +1128,10 @@ def get_text_pool(length_category):
 
 def run_benchmark(host, port, concurrency, num_requests, mode, text_pool,
                   spk_id, output_dir, prompt_text=None, prompt_wav=None,
-                  instruct_text=None):
+                  instruct_text=None, seed=9):
     print(f"\n{'='*60}")
     print(f"  并发压测: concurrency={concurrency}, total_requests={num_requests}")
-    print(f"  mode={mode}, spk_id={spk_id}")
+    print(f"  mode={mode}, spk_id={spk_id}, seed={seed}")
     print(f"  文本池大小={len(text_pool)}, 模式=轮询取不同文本")
     print(f"  target={host}:{port}")
     print(f"{'='*60}\n")
@@ -1122,7 +1144,7 @@ def run_benchmark(host, port, concurrency, num_requests, mode, text_pool,
             text = text_pool[i % len(text_pool)]
             futures.append(
                 executor.submit(send_request, i, host, port, mode, text, spk_id,
-                                output_dir, prompt_text, prompt_wav, instruct_text)
+                                output_dir, prompt_text, prompt_wav, instruct_text, seed)
             )
 
         for future in concurrent.futures.as_completed(futures):
@@ -1189,7 +1211,7 @@ def run_benchmark(host, port, concurrency, num_requests, mode, text_pool,
 
 def auto_probe(host, port, max_concurrency, num_requests_per_level, mode,
                 text_pool, spk_id, output_dir, prompt_text=None,
-                prompt_wav=None, instruct_text=None):
+                prompt_wav=None, instruct_text=None, seed=9):
     print(f"\n自动探测: 从1个并发开始递增，直到出现失败")
     max_ok = 0
     for c in range(1, max_concurrency + 1):
@@ -1197,7 +1219,7 @@ def auto_probe(host, port, max_concurrency, num_requests_per_level, mode,
         ok, fail = run_benchmark(
             host, port, c, num_requests_per_level,
             mode, text_pool, spk_id, output_dir,
-            prompt_text, prompt_wav, instruct_text
+            prompt_text, prompt_wav, instruct_text, seed
         )
         if fail > 0:
             print(f"\n{'*'*60}")
@@ -1237,6 +1259,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='', help='保存音频文件的目录（空则不保存）')
     parser.add_argument('--auto_probe', action='store_true', help='自动递增并发数探测上限')
     parser.add_argument('--max_concurrency', type=int, default=8, help='auto_probe最大并发探测数')
+    parser.add_argument('--seed', type=int, default=9, help='Random seed for deterministic output (default 9)')
     args = parser.parse_args()
 
     if args.output_dir:
@@ -1258,27 +1281,173 @@ if __name__ == '__main__':
         auto_probe(
             args.host, args.port, args.max_concurrency, args.num_requests,
             args.mode, text_pool, args.spk_id, args.output_dir,
-            prompt_text, prompt_wav, instruct_text
+            prompt_text, prompt_wav, instruct_text, args.seed
         )
     else:
         all_results.clear()
         run_benchmark(
             args.host, args.port, args.concurrency, args.num_requests,
             args.mode, text_pool, args.spk_id, args.output_dir,
-            prompt_text, prompt_wav, instruct_text
+            prompt_text, prompt_wav, instruct_text, args.seed
         )
 ___DEPLOY_BENCH_EOF___
 
-echo "[4/4] Created bench_client.py"
+echo "[4/5] Created bench_client.py"
+
+# --- test_seeds.sh ---
+cat << '___DEPLOY_TEST_SEEDS_EOF___' > test_seeds.sh
+#!/bin/bash
+# test_seeds.sh - Test different seed values to find the best timbre
+# Usage: bash test_seeds.sh [start_seed] [end_seed]
+#
+# Prerequisites:
+#   1. Server must be running: bash run_server.sh ../weight/CosyVoice2-0.5B 1 50000
+#   2. Wait for server to be ready (check with: python3 client.py --mode health)
+
+START=${1:-0}
+END=${2:-20}
+OUTPUT_DIR="seed_test"
+TEXT='一笔44000元的现金，利率还有3.0折优惠，原先12期总分期利息3960.00元，现在只需要1168.08元'
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "=== Testing seeds $START to $END ==="
+echo "Text: $TEXT"
+echo "Output: $OUTPUT_DIR/"
+echo ""
+
+for seed in $(seq $START $END); do
+    echo -n "Seed $seed ... "
+    python3 client.py --mode sft \
+        --tts_text "$TEXT" \
+        --spk_id '中文女' \
+        --seed $seed \
+        --output "$OUTPUT_DIR/seed_${seed}.wav" 2>&1 | tail -1
+done
+
+echo ""
+echo "=== Done ==="
+echo "Generated $(ls $OUTPUT_DIR/seed_*.wav 2>/dev/null | wc -l) files in $OUTPUT_DIR/"
+echo "Listen to each file and pick the best seed."
+___DEPLOY_TEST_SEEDS_EOF___
+
+chmod +x test_seeds.sh
+echo "[5/5] Created test_seeds.sh (executable)"
+
+# --- Patch model code: cosyvoice/cli/model.py and cosyvoice/cli/cosyvoice.py ---
+echo ""
+echo "Patching model code..."
+
+python3 -c "
+import sys, os
+
+MODEL_FILE = 'cosyvoice/cli/model.py'
+COSYVOICE_FILE = 'cosyvoice/cli/cosyvoice.py'
+
+def patch_model():
+    if not os.path.isfile(MODEL_FILE):
+        print(f'ERROR: {MODEL_FILE} not found')
+        sys.exit(1)
+    with open(MODEL_FILE, 'r') as f:
+        content = f.read()
+    if 'seed = kwargs.get' in content:
+        print(f'SKIP: {MODEL_FILE} - seed already applied')
+        return
+    anchor = '''        # this_uuid is used to track variables related to this inference thread
+        this_uuid = str(uuid.uuid1())
+        with self.lock:
+            self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
+            self.hift_cache_dict[this_uuid] = None
+        if stream is True:
+            token_offset = 0
+            # 删除线程操作，串行执行推理，加速首包时延'''
+    replacement = '''        seed = kwargs.get(\"seed\", None)
+        if seed is not None:
+            import torch
+            torch.manual_seed(seed)
+            try:
+                import torch_npu
+                torch_npu.npu.manual_seed_all(seed)
+            except (ImportError, RuntimeError):
+                pass
+        # this_uuid is used to track variables related to this inference thread
+        this_uuid = str(uuid.uuid1())
+        with self.lock:
+            self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
+            self.hift_cache_dict[this_uuid] = None
+        if stream is True:
+            token_offset = 0
+            # 删除线程操作，串行执行推理，加速首包时延'''
+    if anchor in content:
+        content = content.replace(anchor, replacement)
+        with open(MODEL_FILE, 'w') as f:
+            f.write(content)
+        print(f'OK: {MODEL_FILE} - added seed to CosyVoice2Model.tts()')
+    else:
+        print(f'ERROR: {MODEL_FILE} - CosyVoice2Model.tts() anchor not found')
+        sys.exit(1)
+
+def patch_cosyvoice():
+    if not os.path.isfile(COSYVOICE_FILE):
+        print(f'ERROR: {COSYVOICE_FILE} not found')
+        sys.exit(1)
+    with open(COSYVOICE_FILE, 'r') as f:
+        content = f.read()
+    
+    new_sigs = [
+        'def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True, seed=None):',
+        'def inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, seed=None):',
+        'def inference_cross_lingual(self, tts_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, seed=None):',
+        'def inference_instruct2(self, tts_text, instruct_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, seed=None):',
+        'for model_output in self.model.tts(**model_input, stream=stream, speed=speed, seed=seed):',
+    ]
+    if all(sig in content for sig in new_sigs):
+        print(f'SKIP: {COSYVOICE_FILE} - seed already applied')
+        return
+    
+    changed = False
+    edits = [
+        ('def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):',
+         'def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True, seed=None):'),
+        ('def inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):',
+         'def inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, seed=None):'),
+        ('def inference_cross_lingual(self, tts_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):',
+         'def inference_cross_lingual(self, tts_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, seed=None):'),
+        ('def inference_instruct2(self, tts_text, instruct_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):',
+         'def inference_instruct2(self, tts_text, instruct_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, seed=None):'),
+        ('for model_output in self.model.tts(**model_input, stream=stream, speed=speed):',
+         'for model_output in self.model.tts(**model_input, stream=stream, speed=speed, seed=seed):'),
+    ]
+    for old, new in edits:
+        if new in content:
+            continue
+        if old in content:
+            content = content.replace(old, new)
+            changed = True
+            print(f'OK: {COSYVOICE_FILE} - {old[:60]}...')
+        else:
+            print(f'WARN: {COSYVOICE_FILE} - not found: {old[:60]}...')
+    if changed:
+        with open(COSYVOICE_FILE, 'w') as f:
+            f.write(content)
+
+patch_model()
+patch_cosyvoice()
+"
 
 echo ""
 echo "=== Deployment complete! ==="
 echo ""
 echo "Files created:"
-echo "  server.py      - Multi-process streaming TTS server"
-echo "  client.py      - Test client"
-echo "  run_server.sh  - Startup script (conda + Ascend env + lib paths)"
+echo "  server.py       - Multi-process streaming TTS server"
+echo "  client.py       - Test client"
+echo "  run_server.sh   - Startup script (conda + Ascend env + lib paths)"
 echo "  bench_client.py - HTTP concurrent benchmark"
+echo "  test_seeds.sh   - Seed tuning script"
+echo ""
+echo "Model files patched:"
+echo "  cosyvoice/cli/model.py      - Added seed support to CosyVoice2Model.tts()"
+echo "  cosyvoice/cli/cosyvoice.py  - Added seed parameter to inference methods"
 echo ""
 echo "Quick start:"
 echo "  1. Adjust ASCEND_RT_VISIBLE_DEVICES if needed"
@@ -1286,15 +1455,12 @@ echo "  2. Run:  bash run_server.sh ../weight/CosyVoice2-0.5B 2 50000"
 echo "     (auto-detects NUMA topology and binds CPU cores + memory)"
 echo "  3. Test: python3 client.py --mode health"
 echo "  4. Test: python3 client.py --mode sft --tts_text '你好世界' --spk_id '中文女'"
-echo "  5. Bench: python3 bench_client.py --concurrency 2 --num_requests 5"
-echo "  6. Auto-probe: python3 bench_client.py --auto_probe --max_concurrency 4 --num_requests 3"
+echo "  5. Test with custom seed: python3 client.py --mode sft --tts_text '你好世界' --seed 42"
+echo "  6. Find best seed: bash test_seeds.sh 0 20"
+echo "  7. Bench: python3 bench_client.py --concurrency 2 --num_requests 5"
+echo ""
+echo "With custom seed (e.g. seed=42):"
+echo "  bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 \"\" 42"
 echo ""
 echo "With manual CPU binding (e.g. bind to cores 0-11 on NUMA node 0):"
 echo "  bash run_server.sh ../weight/CosyVoice2-0.5B 8 50000 1 1800 0,1,2,3,4,5,6,7,8,9,10,11"
-echo ""
-echo "For constrained NPU environments:"
-echo "  bash run_server.sh ../weight/CosyVoice2-0.5B 6 50000 1 1800"
-echo "  # 6 workers, load_concurrency=1 (serialized loading), timeout=30min"
-echo ""
-echo "Or set TE_PARALLEL_COMPILER=1 for maximum safety:"
-echo "  TE_PARALLEL_COMPILER=1 bash run_server.sh ../weight/CosyVoice2-0.5B 6 50000 1 1800"
